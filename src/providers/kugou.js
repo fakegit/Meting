@@ -119,8 +119,37 @@ export default class KugouProvider extends BaseProvider {
 
   /**
    * 获取音频播放链接
+   * 有 cookie 时走新接口（songinfo + 签名），无 cookie 走老接口
    */
   url(id, br = 320) {
+    const cookie = this.parseCookie(this.meting.header['Cookie'] || '');
+    const hasToken = !!(cookie.t && cookie.KugooID);
+
+    if (hasToken) {
+      const now = Date.now();
+      const params = {
+        srcappid: '2919',
+        clientver: '20000',
+        clienttime: String(now),
+        mid: cookie.mid || cookie.kg_mid || '',
+        uuid: cookie.uuid || cookie.mid || cookie.kg_mid || '',
+        dfid: cookie.dfid || cookie.kg_dfid || '',
+        appid: '1014',
+        platid: '4',
+        hash: id,
+        token: cookie.t || '',
+        userid: cookie.KugooID || ''
+      };
+
+      return {
+        method: 'GET',
+        url: this.buildSonginfoUrl(params),
+        body: null,
+        decode: 'kugou_url_new'
+      };
+    }
+
+    // 老接口，无需 cookie
     return {
       method: 'POST',
       url: 'http://media.store.kugou.com/v1/get_res_privilege',
@@ -139,7 +168,7 @@ export default class KugouProvider extends BaseProvider {
           hash: id
         }]
       }),
-      decode: 'kugou_url'
+      decode: 'kugou_url_legacy'
     };
   }
 
@@ -181,30 +210,65 @@ export default class KugouProvider extends BaseProvider {
     const filename = data.filename || data.fileName;
     const result = {
       id: data.hash,
-      name: filename,
+      name: data.songName || filename,
       artist: [],
       album: data.album_name || '',
-      url_id: data.hash,
+      url_id: data.encode_album_audio_id || data.hash,
       pic_id: data.hash,
       lyric_id: data.hash,
       source: 'kugou'
     };
-    
-    const parts = filename.split(' - ');
-    if (parts.length >= 2) {
-      result.artist = parts[0].split('、');
-      result.name = parts[1];
+
+    if (data.authors && Array.isArray(data.authors)) {
+      result.artist = data.authors.map(a => a.author_name);
+    } else if (filename) {
+      const parts = filename.split(' - ');
+      if (parts.length >= 2) {
+        result.artist = parts[0].split('、');
+        result.name = parts[1];
+      }
     }
-    
+
     return result;
+  }
+
+  /**
+   * 解析 Cookie 字符串为对象
+   */
+  parseCookie(cookieStr) {
+    const cookies = {};
+    if (!cookieStr) return cookies;
+    cookieStr.split(';').forEach(pair => {
+      const idx = pair.indexOf('=');
+      if (idx > 0) {
+        const key = pair.substring(0, idx).trim();
+        const val = pair.substring(idx + 1).trim();
+        cookies[key] = val;
+      }
+    });
+    return cookies;
+  }
+
+  /**
+   * 生成酷狗 API 签名
+   */
+  getSignature(params) {
+    const MD5_KEY = 'NVPh5oo715z5DIWAeQlhMDsWXXQV4hwt';
+    const paramStr = Object.entries(params)
+      .map(([k, v]) => `${k}=${v}`)
+      .join('&');
+    const sorted = paramStr.split('&').sort().join('');
+    return crypto.createHash('md5').update(`${MD5_KEY}${sorted}${MD5_KEY}`).digest('hex');
   }
 
   /**
    * 处理酷狗音乐的解码逻辑
    */
   async handleDecode(decodeType, data) {
-    if (decodeType === 'kugou_url') {
-      return this.urlDecode(data);
+    if (decodeType === 'kugou_url_new') {
+      return this.urlDecodeNew(data);
+    } else if (decodeType === 'kugou_url_legacy') {
+      return this.urlDecodeLegacy(data);
     } else if (decodeType === 'kugou_lyric') {
       return this.lyricDecode(data);
     }
@@ -212,50 +276,111 @@ export default class KugouProvider extends BaseProvider {
   }
 
   /**
-   * 酷狗音乐 URL 解码
+   * 构建带签名的 songinfo 请求 URL
    */
-  async urlDecode(result) {
-    const data = JSON.parse(result);
-    
-    let maxBr = 0;
-    let url;
-    
-    for (const item of data.data[0].relate_goods) {
-      if (item.info.bitrate <= this.meting.temp.br && item.info.bitrate > maxBr) {
-        const api = {
-          method: 'GET',
-          url: 'http://trackercdn.kugou.com/i/v2/',
-          body: {
-            hash: item.hash,
-            key: crypto.createHash('md5').update(item.hash + 'kgcloudv2').digest('hex'),
-            pid: 3,
-            behavior: 'play',
-            cmd: '25',
-            version: 8990
-          }
-        };
-        
-        const response = JSON.parse(await this.meting._exec(api));
-        if (response.url) {
-          maxBr = response.bitRate / 1000;
-          url = {
-            url: Array.isArray(response.url) ? response.url[0] : response.url,
-            size: response.fileSize,
-            br: response.bitRate / 1000
+  buildSonginfoUrl(params) {
+    const signature = this.getSignature(params);
+    const queryString = Object.entries(params)
+      .map(([k, v]) => `${k}=${encodeURIComponent(v)}`)
+      .join('&');
+    return `https://wwwapi.kugou.com/play/songinfo?${queryString}&signature=${signature}`;
+  }
+
+  /**
+   * 酷狗音乐 URL 解码（新接口，需要 cookie）
+   * 第一步用 hash 查询获取 encode_album_audio_id，
+   * 第二步用 encode_album_audio_id 查询获取播放链接
+   */
+  async urlDecodeNew(result) {
+    try {
+      const json = JSON.parse(result);
+      const data = json.data;
+      if (!data || !data.encode_album_audio_id) {
+        return JSON.stringify({ url: '', size: 0, br: -1 });
+      }
+
+      // 第二步：用 encode_album_audio_id 重新查询
+      const cookie = this.parseCookie(this.meting.header['Cookie'] || '');
+      const now = Date.now();
+      const params = {
+        srcappid: '2919',
+        clientver: '20000',
+        clienttime: String(now),
+        mid: cookie.mid || cookie.kg_mid || '',
+        uuid: cookie.uuid || cookie.mid || cookie.kg_mid || '',
+        dfid: cookie.dfid || cookie.kg_dfid || '',
+        appid: '1014',
+        platid: '4',
+        encode_album_audio_id: data.encode_album_audio_id,
+        token: cookie.t || '',
+        userid: cookie.KugooID || ''
+      };
+
+      const api = {
+        method: 'GET',
+        url: this.buildSonginfoUrl(params),
+        body: null
+      };
+      const response = JSON.parse(await this.meting._exec(api));
+      const detail = response.data;
+      if (detail) {
+        const url = detail.play_url || detail.play_backup_url || '';
+        return JSON.stringify({
+          url: url,
+          size: detail.filesize || 0,
+          br: detail.bitrate || -1
+        });
+      }
+    } catch (e) {
+      // parse error
+    }
+    return JSON.stringify({ url: '', size: 0, br: -1 });
+  }
+
+  /**
+   * 酷狗音乐 URL 解码（老接口，无需 cookie）
+   */
+  async urlDecodeLegacy(result) {
+    try {
+      const data = JSON.parse(result);
+
+      let maxBr = 0;
+      let url;
+
+      for (const item of data.data[0].relate_goods) {
+        if (item.info.bitrate <= this.meting.temp.br && item.info.bitrate > maxBr) {
+          const api = {
+            method: 'GET',
+            url: 'http://trackercdn.kugou.com/i/v2/',
+            body: {
+              hash: item.hash,
+              key: crypto.createHash('md5').update(item.hash + 'kgcloudv2').digest('hex'),
+              pid: 3,
+              behavior: 'play',
+              cmd: '25',
+              version: 8990
+            }
           };
+
+          const response = JSON.parse(await this.meting._exec(api));
+          if (response.url) {
+            maxBr = response.bitRate / 1000;
+            url = {
+              url: Array.isArray(response.url) ? response.url[0] : response.url,
+              size: response.fileSize,
+              br: response.bitRate / 1000
+            };
+          }
         }
       }
+
+      if (url) {
+        return JSON.stringify(url);
+      }
+    } catch (e) {
+      // parse error
     }
-    
-    if (!url) {
-      url = {
-        url: '',
-        size: 0,
-        br: -1
-      };
-    }
-    
-    return JSON.stringify(url);
+    return JSON.stringify({ url: '', size: 0, br: -1 });
   }
 
   /**

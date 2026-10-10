@@ -26,20 +26,22 @@ export default class TencentProvider extends BaseProvider {
 
   /**
    * 搜索歌曲
+   *
+   * 注意：旧接口 client_search_cp 已下线（HTTP 500），
+   * 这里改用同域名下仍在服务的 search_for_qq_cp，
+   * 该接口只返回老版字段（songmid/songname/albummid/albumname），
+   * 因此 format() 需要同时兼容新旧两种字段格式。
    */
   search(keyword, option = {}) {
     return {
       method: 'GET',
-      url: 'https://c.y.qq.com/soso/fcgi-bin/client_search_cp',
+      url: 'https://c.y.qq.com/soso/fcgi-bin/search_for_qq_cp',
       body: {
         format: 'json',
         p: option.page || 1,
         n: option.limit || 30,
-        w: keyword,
-        aggr: 1,
-        lossless: 1,
-        cr: 1,
-        new_json: 1
+        w: keyword
+        // 不要传 aggr=1：老接口下会导致分页/条数（p、n）失效
       },
       format: 'data.song.list'
     };
@@ -160,22 +162,28 @@ export default class TencentProvider extends BaseProvider {
     if (data.musicData) {
       data = data.musicData;
     }
-    
+
+    // 兼容新版字段（mid/name/album.title）与老版字段（songmid/songname/albumname）
+    const mid = data.songmid || data.mid;
+    const album = data.album && data.album.title !== undefined
+      ? data.album.title
+      : (data.albumname || '');
+
     const result = {
-      id: data.mid,
-      name: data.name,
+      id: mid,
+      name: data.songname || data.name,
       artist: [],
-      album: data.album.title.trim(),
-      pic_id: data.album.mid,
-      url_id: data.mid,
-      lyric_id: data.mid,
+      album: String(album || '').trim(),
+      pic_id: (data.album && data.album.mid) || data.albummid,
+      url_id: mid,
+      lyric_id: mid,
       source: 'tencent'
     };
-    
-    data.singer.forEach(singer => {
+
+    (data.singer || []).forEach(singer => {
       result.artist.push(singer.name);
     });
-    
+
     return result;
   }
 
@@ -277,17 +285,52 @@ export default class TencentProvider extends BaseProvider {
   }
 
   /**
+   * 解码HTML实体编码
+   */
+  decodeHtmlEntities(text) {
+    if (!text) return text;
+
+    // 常见HTML实体编码映射
+    const entityMap = {
+      '&apos;': "'",
+      '&quot;': '"',
+      '&amp;': '&',
+      '&lt;': '<',
+      '&gt;': '>',
+      '&nbsp;': ' '
+    };
+
+    // 替换命名实体
+    let decoded = text;
+    for (const [entity, char] of Object.entries(entityMap)) {
+      decoded = decoded.replace(new RegExp(entity, 'g'), char);
+    }
+
+    // 替换数字实体（如 &#39; &#34; 等）
+    decoded = decoded.replace(/&#(\d+);/g, (match, dec) => {
+      return String.fromCharCode(parseInt(dec, 10));
+    });
+
+    // 替换十六进制实体（如 &#x27; 等）
+    decoded = decoded.replace(/&#x([0-9a-fA-F]+);/g, (match, hex) => {
+      return String.fromCharCode(parseInt(hex, 16));
+    });
+
+    return decoded;
+  }
+
+  /**
    * 腾讯音乐歌词解码
    */
   lyricDecode(result) {
     const jsonStr = result.substring(18, result.length - 1);
     const data = JSON.parse(jsonStr);
-    
+
     const lyricData = {
-      lyric: data.lyric ? Buffer.from(data.lyric, 'base64').toString() : '',
-      tlyric: data.trans ? Buffer.from(data.trans, 'base64').toString() : ''
+      lyric: data.lyric ? this.decodeHtmlEntities(Buffer.from(data.lyric, 'base64').toString()) : '',
+      tlyric: data.trans ? this.decodeHtmlEntities(Buffer.from(data.trans, 'base64').toString()) : ''
     };
-    
+
     return JSON.stringify(lyricData);
   }
 }

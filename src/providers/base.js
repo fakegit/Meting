@@ -156,7 +156,7 @@ export default class BaseProvider {
     }
 
     // 如果有格式化规则，进行数据清理
-    if (api.format) {
+    if ('format' in api) {
       data = this.cleanData(data, api.format, meting);
     }
 
